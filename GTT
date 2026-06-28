@@ -1,0 +1,1960 @@
+﻿===== go.mod =====
+module zerocopybitcask
+
+go 1.24
+
+===== types.go =====
+package zerocopybitcask
+
+import (
+	"errors"
+	"hash/fnv"
+	"sync"
+	"sync/atomic"
+	"time"
+	"unsafe"
+)
+
+const (
+	HeaderSize      = 20
+	CRCOffset       = 0
+	TimestampOffset = 4
+	KeySizeOffset   = 12
+	ValueSizeOffset = 16
+
+	DefaultMaxKeySize    = 64 << 10
+	DefaultMaxValueSize  = 1 << 20
+	DefaultMaxActiveSize = 1 << 30
+	DefaultKeyDirShards  = 256
+)
+
+var (
+	ErrKeyNotFound    = errors.New("key not found")
+	ErrKeyTooLarge    = errors.New("key exceeds maximum size")
+	ErrValueTooLarge  = errors.New("value exceeds maximum size")
+	ErrEmptyKey       = errors.New("key must not be empty")
+	ErrCorruptRecord  = errors.New("corrupt record")
+	ErrDatabaseClosed = errors.New("database is closed")
+)
+
+type RecordState struct {
+	FileID      uint32
+	ValueSize   uint32
+	ValueOffset uint64
+	Timestamp   uint64
+}
+
+type CompactionStats struct {
+	InputFiles        int
+	LiveRecords       uint64
+	StaleRecords      uint64
+	TombstonesDropped uint64
+	BytesRewritten    uint64
+	OutputFileID      uint32
+}
+
+type FsyncPolicy int
+
+const (
+	FsyncEveryWrite FsyncPolicy = iota
+	FsyncManual
+	FsyncInterval
+)
+
+type keyDirShard struct {
+	mu sync.RWMutex
+	m  map[string]RecordState
+}
+
+type KeyDir struct {
+	shards []keyDirShard
+}
+
+func NewKeyDir(shardCount int) *KeyDir {
+	if shardCount <= 0 {
+		shardCount = DefaultKeyDirShards
+	}
+	kd := &KeyDir{shards: make([]keyDirShard, shardCount)}
+	for i := range kd.shards {
+		kd.shards[i].m = make(map[string]RecordState)
+	}
+	return kd
+}
+
+func (k *KeyDir) Get(key []byte) (RecordState, bool) {
+	shard := k.shard(key)
+	shard.mu.RLock()
+	state, ok := shard.m[bytesToString(key)]
+	shard.mu.RUnlock()
+	return state, ok
+}
+
+func (k *KeyDir) Set(key []byte, state RecordState) {
+	shard := k.shard(key)
+	shard.mu.Lock()
+	shard.m[string(key)] = state
+	shard.mu.Unlock()
+}
+
+func (k *KeyDir) Delete(key []byte) {
+	shard := k.shard(key)
+	shard.mu.Lock()
+	delete(shard.m, bytesToString(key))
+	shard.mu.Unlock()
+}
+
+func (k *KeyDir) Snapshot() map[string]RecordState {
+	out := make(map[string]RecordState)
+	for i := range k.shards {
+		shard := &k.shards[i]
+		shard.mu.RLock()
+		for key, state := range shard.m {
+			out[key] = state
+		}
+		shard.mu.RUnlock()
+	}
+	return out
+}
+
+func (k *KeyDir) shard(key []byte) *keyDirShard {
+	h := fnv.New32a()
+	_, _ = h.Write(key)
+	return &k.shards[int(h.Sum32())%len(k.shards)]
+}
+
+func bytesToString(b []byte) string {
+	return unsafe.String(unsafe.SliceData(b), len(b))
+}
+
+type Options struct {
+	Dir                      string
+	SyncWrites               bool
+	FsyncPolicy              FsyncPolicy
+	FsyncInterval            time.Duration
+	MaxKeySize               uint32
+	MaxValueSize             uint32
+	MaxActiveFileSize        int64
+	KeyDirShards             int
+	CompactionThresholdBytes int64
+}
+
+func (o Options) withDefaults() Options {
+	if o.MaxKeySize == 0 {
+		o.MaxKeySize = DefaultMaxKeySize
+	}
+	if o.MaxValueSize == 0 {
+		o.MaxValueSize = DefaultMaxValueSize
+	}
+	if o.MaxActiveFileSize == 0 {
+		o.MaxActiveFileSize = DefaultMaxActiveSize
+	}
+	if o.KeyDirShards == 0 {
+		o.KeyDirShards = DefaultKeyDirShards
+	}
+	if o.SyncWrites {
+		o.FsyncPolicy = FsyncEveryWrite
+	}
+	if o.FsyncPolicy == FsyncInterval && o.FsyncInterval <= 0 {
+		o.FsyncInterval = time.Second
+	}
+	return o
+}
+
+type Stats struct {
+	Gets           uint64
+	Puts           uint64
+	Deletes        uint64
+	BytesWritten   uint64
+	Fsyncs         uint64
+	Rotations      uint64
+	Compactions    uint64
+	MmapRefreshes  uint64
+	CorruptRecords uint64
+	Tombstones     uint64
+	KeyCount       uint64
+	RetiredMmaps   uint64
+	ObsoleteFiles  uint64
+}
+
+type dbStats struct {
+	gets           atomic.Uint64
+	puts           atomic.Uint64
+	deletes        atomic.Uint64
+	bytesWritten   atomic.Uint64
+	fsyncs         atomic.Uint64
+	rotations      atomic.Uint64
+	compactions    atomic.Uint64
+	mmapRefreshes  atomic.Uint64
+	corruptRecords atomic.Uint64
+	tombstones     atomic.Uint64
+	staleRecords   atomic.Uint64
+}
+
+===== codec.go =====
+package zerocopybitcask
+
+import (
+	"encoding/binary"
+	"hash/crc32"
+)
+
+type Header struct {
+	CRC       uint32
+	Timestamp uint64
+	KeySize   uint32
+	ValueSize uint32
+}
+
+func EncodeRecord(key, value []byte, timestamp uint64) []byte {
+	size := HeaderSize + len(key) + len(value)
+	buf := make([]byte, size)
+	binary.BigEndian.PutUint64(buf[TimestampOffset:], timestamp)
+	binary.BigEndian.PutUint32(buf[KeySizeOffset:], uint32(len(key)))
+	binary.BigEndian.PutUint32(buf[ValueSizeOffset:], uint32(len(value)))
+	copy(buf[HeaderSize:], key)
+	copy(buf[HeaderSize+len(key):], value)
+	binary.BigEndian.PutUint32(buf[CRCOffset:], crc32.ChecksumIEEE(buf[TimestampOffset:]))
+	return buf
+}
+
+func DecodeHeader(buf []byte) (Header, error) {
+	if len(buf) < HeaderSize {
+		return Header{}, ErrCorruptRecord
+	}
+	return Header{
+		CRC:       binary.BigEndian.Uint32(buf[CRCOffset:]),
+		Timestamp: binary.BigEndian.Uint64(buf[TimestampOffset:]),
+		KeySize:   binary.BigEndian.Uint32(buf[KeySizeOffset:]),
+		ValueSize: binary.BigEndian.Uint32(buf[ValueSizeOffset:]),
+	}, nil
+}
+
+func VerifyRecord(buf []byte) (Header, bool) {
+	header, err := DecodeHeader(buf)
+	if err != nil {
+		return Header{}, false
+	}
+	total := HeaderSize + int(header.KeySize) + int(header.ValueSize)
+	if total < HeaderSize || len(buf) < total {
+		return Header{}, false
+	}
+	return header, crc32.ChecksumIEEE(buf[TimestampOffset:total]) == header.CRC
+}
+
+func RecordSize(header Header) uint64 {
+	return uint64(HeaderSize) + uint64(header.KeySize) + uint64(header.ValueSize)
+}
+
+===== db_write.go =====
+package zerocopybitcask
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+)
+
+type DB struct {
+	opts Options
+
+	keydir *KeyDir
+
+	writeMu   sync.Mutex
+	compactMu sync.Mutex
+	mapMu     sync.RWMutex
+
+	activeFile    *os.File
+	activeFileID  uint32
+	activeSize    int64
+	maps          map[uint32]*mmapRegion
+	retiredMaps   []*mmapRegion
+	obsoleteFiles []uint32
+	lastSync      time.Time
+	stats         dbStats
+
+	closed bool
+}
+
+func Open(opts Options) (*DB, error) {
+	opts = opts.withDefaults()
+	if opts.Dir == "" {
+		return nil, fmt.Errorf("dir is required")
+	}
+	if err := os.MkdirAll(opts.Dir, 0755); err != nil {
+		return nil, err
+	}
+
+	db := &DB{
+		opts:   opts,
+		keydir: NewKeyDir(opts.KeyDirShards),
+		maps:   make(map[uint32]*mmapRegion),
+	}
+	if err := db.recover(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return db, nil
+}
+
+func (db *DB) Put(key, value []byte) error {
+	if err := db.validate(key, value); err != nil {
+		return err
+	}
+	return db.putAt(key, value, uint64(time.Now().UnixNano()))
+}
+
+func (db *DB) Delete(key []byte) error {
+	if len(key) == 0 {
+		return ErrEmptyKey
+	}
+	if uint32(len(key)) > db.opts.MaxKeySize {
+		return ErrKeyTooLarge
+	}
+	return db.putAt(key, nil, uint64(time.Now().UnixNano()))
+}
+
+func (db *DB) Sync() error {
+	db.writeMu.Lock()
+	defer db.writeMu.Unlock()
+	if db.closed {
+		return ErrDatabaseClosed
+	}
+	return db.syncLocked()
+}
+
+func (db *DB) Close() error {
+	db.writeMu.Lock()
+	defer db.writeMu.Unlock()
+
+	db.closed = true
+	var first error
+	if db.activeFile != nil {
+		if err := db.activeFile.Close(); err != nil {
+			first = err
+		}
+		db.activeFile = nil
+	}
+
+	db.mapMu.Lock()
+	for id, region := range db.maps {
+		if err := region.Close(); err != nil && first == nil {
+			first = err
+		}
+		delete(db.maps, id)
+	}
+	for _, region := range db.retiredMaps {
+		if err := region.Close(); err != nil && first == nil {
+			first = err
+		}
+	}
+	db.retiredMaps = nil
+	for _, fileID := range db.obsoleteFiles {
+		if err := os.Remove(dataFilePath(db.opts.Dir, fileID)); err != nil && first == nil && !os.IsNotExist(err) {
+			first = err
+		}
+	}
+	db.obsoleteFiles = nil
+	db.mapMu.Unlock()
+	return first
+}
+
+func (db *DB) putAt(key, value []byte, timestamp uint64) error {
+	record := EncodeRecord(key, value, timestamp)
+
+	db.writeMu.Lock()
+	defer db.writeMu.Unlock()
+	if db.closed {
+		return ErrDatabaseClosed
+	}
+	if db.activeSize > 0 && db.activeSize+int64(len(record)) > db.opts.MaxActiveFileSize {
+		if err := db.rotateActiveFileLocked(); err != nil {
+			return err
+		}
+	}
+
+	recordOffset := db.activeSize
+	n, err := db.activeFile.Write(record)
+	if err != nil {
+		return err
+	}
+	if n != len(record) {
+		return fmt.Errorf("short write: %d of %d", n, len(record))
+	}
+	db.activeSize += int64(n)
+	db.stats.bytesWritten.Add(uint64(n))
+	if db.shouldSyncLocked() {
+		if err := db.syncLocked(); err != nil {
+			return err
+		}
+	}
+
+	valueOffset := uint64(recordOffset) + HeaderSize + uint64(len(key))
+	db.keydir.Set(key, RecordState{
+		FileID:      db.activeFileID,
+		ValueSize:   uint32(len(value)),
+		ValueOffset: valueOffset,
+		Timestamp:   timestamp,
+	})
+	if len(value) == 0 {
+		db.stats.deletes.Add(1)
+		db.stats.tombstones.Add(1)
+	} else {
+		db.stats.puts.Add(1)
+	}
+	return db.refreshMapLocked(db.activeFileID)
+}
+
+func (db *DB) validate(key, value []byte) error {
+	if len(key) == 0 {
+		return ErrEmptyKey
+	}
+	if uint32(len(key)) > db.opts.MaxKeySize {
+		return ErrKeyTooLarge
+	}
+	if uint32(len(value)) > db.opts.MaxValueSize {
+		return ErrValueTooLarge
+	}
+	return nil
+}
+
+func (db *DB) rotateActiveFileLocked() error {
+	if db.activeFile != nil {
+		if err := db.syncLocked(); err != nil {
+			return err
+		}
+		if err := db.activeFile.Close(); err != nil {
+			return err
+		}
+	}
+	db.activeFileID++
+	db.activeSize = 0
+	file, err := os.OpenFile(dataFilePath(db.opts.Dir, db.activeFileID), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	db.activeFile = file
+	db.stats.rotations.Add(1)
+	return db.refreshMapLocked(db.activeFileID)
+}
+
+func (db *DB) refreshMapLocked(fileID uint32) error {
+	path := dataFilePath(db.opts.Dir, fileID)
+	region, err := mmapFile(path)
+	if err != nil {
+		return err
+	}
+	db.mapMu.Lock()
+	old := db.maps[fileID]
+	db.maps[fileID] = region
+	if old != nil {
+		db.retiredMaps = append(db.retiredMaps, old)
+	}
+	db.mapMu.Unlock()
+	db.stats.mmapRefreshes.Add(1)
+	return nil
+}
+
+func (db *DB) shouldSyncLocked() bool {
+	switch db.opts.FsyncPolicy {
+	case FsyncManual:
+		return false
+	case FsyncInterval:
+		return db.lastSync.IsZero() || time.Since(db.lastSync) >= db.opts.FsyncInterval
+	default:
+		return true
+	}
+}
+
+func (db *DB) syncLocked() error {
+	if err := db.activeFile.Sync(); err != nil {
+		return err
+	}
+	db.lastSync = time.Now()
+	db.stats.fsyncs.Add(1)
+	return nil
+}
+
+func (db *DB) Stats() Stats {
+	snapshot := db.keydir.Snapshot()
+	db.mapMu.RLock()
+	retired := len(db.retiredMaps)
+	obsolete := len(db.obsoleteFiles)
+	db.mapMu.RUnlock()
+	return Stats{
+		Gets:           db.stats.gets.Load(),
+		Puts:           db.stats.puts.Load(),
+		Deletes:        db.stats.deletes.Load(),
+		BytesWritten:   db.stats.bytesWritten.Load(),
+		Fsyncs:         db.stats.fsyncs.Load(),
+		Rotations:      db.stats.rotations.Load(),
+		Compactions:    db.stats.compactions.Load(),
+		MmapRefreshes:  db.stats.mmapRefreshes.Load(),
+		CorruptRecords: db.stats.corruptRecords.Load(),
+		Tombstones:     db.stats.tombstones.Load(),
+		KeyCount:       uint64(len(snapshot)),
+		RetiredMmaps:   uint64(retired),
+		ObsoleteFiles:  uint64(obsolete),
+	}
+}
+
+func dataFilePath(dir string, fileID uint32) string {
+	return filepath.Join(dir, fmt.Sprintf("%09d.data", fileID))
+}
+
+===== db_read.go =====
+package zerocopybitcask
+
+func (db *DB) Get(key []byte) ([]byte, error) {
+	state, ok := db.keydir.Get(key)
+	if !ok || state.ValueSize == 0 {
+		return nil, ErrKeyNotFound
+	}
+	value, err := db.getState(state)
+	if err == nil {
+		db.stats.gets.Add(1)
+	}
+	return value, err
+}
+
+func (db *DB) getState(state RecordState) ([]byte, error) {
+	db.mapMu.RLock()
+	region := db.maps[state.FileID]
+	if region == nil {
+		db.mapMu.RUnlock()
+		return nil, ErrKeyNotFound
+	}
+	start := state.ValueOffset
+	end := start + uint64(state.ValueSize)
+	if end > uint64(len(region.data)) {
+		db.mapMu.RUnlock()
+		return nil, ErrCorruptRecord
+	}
+	value := region.data[start:end]
+	db.mapMu.RUnlock()
+	return value, nil
+}
+
+===== recovery.go =====
+package zerocopybitcask
+
+import (
+	"errors"
+	"io"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+)
+
+func (db *DB) recover() error {
+	ids, err := dataFileIDs(db.opts.Dir)
+	if err != nil {
+		return err
+	}
+	if len(ids) == 0 {
+		ids = []uint32{1}
+		file, err := os.OpenFile(dataFilePath(db.opts.Dir, 1), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+		if err != nil {
+			return err
+		}
+		if err := file.Close(); err != nil {
+			return err
+		}
+	}
+
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	for _, id := range ids {
+		size, err := db.recoverFile(id)
+		if err != nil {
+			return err
+		}
+		db.activeFileID = id
+		db.activeSize = size
+	}
+
+	activePath := dataFilePath(db.opts.Dir, db.activeFileID)
+	active, err := os.OpenFile(activePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	db.activeFile = active
+
+	for _, id := range ids {
+		if err := db.refreshMapLocked(id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (db *DB) recoverFile(fileID uint32) (int64, error) {
+	path := dataFilePath(db.opts.Dir, fileID)
+	file, err := os.OpenFile(path, os.O_RDWR, 0644)
+	if err != nil {
+		return 0, err
+	}
+	defer file.Close()
+
+	var offset int64
+	headerBuf := make([]byte, HeaderSize)
+	for {
+		_, err := io.ReadFull(file, headerBuf)
+		if errors.Is(err, io.EOF) {
+			return offset, nil
+		}
+		if errors.Is(err, io.ErrUnexpectedEOF) {
+			db.stats.corruptRecords.Add(1)
+			return offset, file.Truncate(offset)
+		}
+		if err != nil {
+			return offset, err
+		}
+
+		header, err := DecodeHeader(headerBuf)
+		if err != nil {
+			db.stats.corruptRecords.Add(1)
+			return offset, file.Truncate(offset)
+		}
+		if header.KeySize == 0 || header.KeySize > db.opts.MaxKeySize || header.ValueSize > db.opts.MaxValueSize {
+			db.stats.corruptRecords.Add(1)
+			return offset, file.Truncate(offset)
+		}
+
+		payloadSize := int64(header.KeySize) + int64(header.ValueSize)
+		record := make([]byte, HeaderSize+payloadSize)
+		copy(record, headerBuf)
+		if _, err := io.ReadFull(file, record[HeaderSize:]); err != nil {
+			db.stats.corruptRecords.Add(1)
+			return offset, file.Truncate(offset)
+		}
+		verified, ok := VerifyRecord(record)
+		if !ok {
+			db.stats.corruptRecords.Add(1)
+			return offset, file.Truncate(offset)
+		}
+
+		keyStart := HeaderSize
+		keyEnd := keyStart + int(verified.KeySize)
+		key := record[keyStart:keyEnd]
+		valueOffset := uint64(offset) + HeaderSize + uint64(verified.KeySize)
+		next := RecordState{
+			FileID:      fileID,
+			ValueSize:   verified.ValueSize,
+			ValueOffset: valueOffset,
+			Timestamp:   verified.Timestamp,
+		}
+		if current, ok := db.keydir.Get(key); !ok || next.Timestamp >= current.Timestamp {
+			db.keydir.Set(key, next)
+		}
+		if verified.ValueSize == 0 {
+			db.stats.tombstones.Add(1)
+		}
+		offset += int64(RecordSize(verified))
+	}
+}
+
+func dataFileIDs(dir string) ([]uint32, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var ids []uint32
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".data") {
+			continue
+		}
+		stem := strings.TrimSuffix(entry.Name(), ".data")
+		n, err := strconv.ParseUint(stem, 10, 32)
+		if err != nil {
+			continue
+		}
+		ids = append(ids, uint32(n))
+	}
+	return ids, nil
+}
+
+func compactedFilePath(dir string, fileID uint32) string {
+	return filepath.Join(dir, strconv.FormatUint(uint64(fileID), 10)+".compact")
+}
+
+===== compaction.go =====
+package zerocopybitcask
+
+import (
+	"io"
+	"os"
+	"sort"
+	"time"
+)
+
+func (db *DB) RunCompaction(interval time.Duration, stop <-chan struct{}) {
+	if interval <= 0 {
+		return
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			_ = db.CompactIfNeeded()
+		case <-stop:
+			return
+		}
+	}
+}
+
+func (db *DB) StartCompactor(interval time.Duration) func() {
+	stop := make(chan struct{})
+	go db.RunCompaction(interval, stop)
+	return func() { close(stop) }
+}
+
+func (db *DB) CompactIfNeeded() error {
+	readonly, err := db.readonlyFileIDs()
+	if err != nil {
+		return err
+	}
+	if len(readonly) == 0 {
+		return nil
+	}
+	if db.opts.CompactionThresholdBytes <= 0 {
+		_, err := db.Compact()
+		return err
+	}
+	size, err := db.totalFileSize(readonly)
+	if err != nil {
+		return err
+	}
+	if size < db.opts.CompactionThresholdBytes {
+		return nil
+	}
+	_, err = db.Compact()
+	return err
+}
+
+func (db *DB) Compact() (CompactionStats, error) {
+	db.compactMu.Lock()
+	defer db.compactMu.Unlock()
+
+	readonly, err := db.readonlyFileIDs()
+	if err != nil {
+		return CompactionStats{}, err
+	}
+	if len(readonly) == 0 {
+		return CompactionStats{}, nil
+	}
+
+	db.writeMu.Lock()
+	if db.closed {
+		db.writeMu.Unlock()
+		return CompactionStats{}, ErrDatabaseClosed
+	}
+	targetID := db.activeFileID + 1
+	db.writeMu.Unlock()
+
+	tmpPath := compactedFilePath(db.opts.Dir, targetID)
+	out, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
+	if err != nil {
+		return CompactionStats{}, err
+	}
+
+	updates := make(map[string]RecordState)
+	result := CompactionStats{InputFiles: len(readonly), OutputFileID: targetID}
+	var writeOffset uint64
+	for _, id := range readonly {
+		if err := db.copyLiveRecords(id, out, &writeOffset, updates, targetID, &result); err != nil {
+			_ = out.Close()
+			_ = os.Remove(tmpPath)
+			return CompactionStats{}, err
+		}
+	}
+	if err := out.Sync(); err != nil {
+		_ = out.Close()
+		_ = os.Remove(tmpPath)
+		return CompactionStats{}, err
+	}
+	if err := out.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return CompactionStats{}, err
+	}
+
+	finalPath := dataFilePath(db.opts.Dir, targetID)
+	db.writeMu.Lock()
+	defer db.writeMu.Unlock()
+	if db.closed {
+		_ = os.Remove(tmpPath)
+		return CompactionStats{}, ErrDatabaseClosed
+	}
+	if db.activeFileID >= targetID {
+		_ = os.Remove(tmpPath)
+		return CompactionStats{}, nil
+	}
+
+	if err := os.Rename(tmpPath, finalPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return CompactionStats{}, err
+	}
+	db.activeFileID = targetID
+	db.activeSize = 0
+	if db.activeFile != nil {
+		if err := db.activeFile.Close(); err != nil {
+			return CompactionStats{}, err
+		}
+	}
+	active, err := os.OpenFile(dataFilePath(db.opts.Dir, db.activeFileID+1), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return CompactionStats{}, err
+	}
+	db.activeFileID++
+	db.activeFile = active
+
+	if err := db.refreshMapLocked(targetID); err != nil {
+		return CompactionStats{}, err
+	}
+
+	for key, state := range updates {
+		current, ok := db.keydir.Get([]byte(key))
+		if ok && current.Timestamp == state.Timestamp {
+			db.keydir.Set([]byte(key), state)
+		}
+	}
+	db.mapMu.Lock()
+	for _, id := range readonly {
+		if region := db.maps[id]; region != nil {
+			db.retiredMaps = append(db.retiredMaps, region)
+			delete(db.maps, id)
+		}
+		db.obsoleteFiles = append(db.obsoleteFiles, id)
+	}
+	db.mapMu.Unlock()
+	db.stats.compactions.Add(1)
+	db.stats.staleRecords.Add(result.StaleRecords)
+	return result, nil
+}
+
+func (db *DB) copyLiveRecords(fileID uint32, out *os.File, writeOffset *uint64, updates map[string]RecordState, targetID uint32, result *CompactionStats) error {
+	in, err := os.Open(dataFilePath(db.opts.Dir, fileID))
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	headerBuf := make([]byte, HeaderSize)
+	for {
+		_, err := io.ReadFull(in, headerBuf)
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		header, err := DecodeHeader(headerBuf)
+		if err != nil {
+			return err
+		}
+		payloadSize := int(header.KeySize + header.ValueSize)
+		record := make([]byte, HeaderSize+payloadSize)
+		copy(record, headerBuf)
+		if _, err := io.ReadFull(in, record[HeaderSize:]); err != nil {
+			return err
+		}
+		verified, ok := VerifyRecord(record)
+		if !ok {
+			return ErrCorruptRecord
+		}
+
+		keyStart := HeaderSize
+		keyEnd := keyStart + int(verified.KeySize)
+		key := record[keyStart:keyEnd]
+		current, ok := db.keydir.Get(key)
+		if !ok || current.Timestamp != verified.Timestamp || current.FileID != fileID || verified.ValueSize == 0 {
+			if verified.ValueSize == 0 {
+				result.TombstonesDropped++
+			} else {
+				result.StaleRecords++
+			}
+			continue
+		}
+
+		n, err := out.Write(record)
+		if err != nil {
+			return err
+		}
+		if n != len(record) {
+			return io.ErrShortWrite
+		}
+		keyCopy := string(key)
+		updates[keyCopy] = RecordState{
+			FileID:      targetID,
+			ValueSize:   verified.ValueSize,
+			ValueOffset: *writeOffset + HeaderSize + uint64(verified.KeySize),
+			Timestamp:   verified.Timestamp,
+		}
+		*writeOffset += uint64(len(record))
+		result.LiveRecords++
+		result.BytesRewritten += uint64(len(record))
+	}
+}
+
+func (db *DB) readonlyFileIDs() ([]uint32, error) {
+	db.writeMu.Lock()
+	if db.closed {
+		db.writeMu.Unlock()
+		return nil, ErrDatabaseClosed
+	}
+	activeID := db.activeFileID
+	db.writeMu.Unlock()
+
+	ids, err := dataFileIDs(db.opts.Dir)
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	var readonly []uint32
+	for _, id := range ids {
+		if id < activeID {
+			readonly = append(readonly, id)
+		}
+	}
+	return readonly, nil
+}
+
+func (db *DB) totalFileSize(ids []uint32) (int64, error) {
+	var total int64
+	for _, id := range ids {
+		info, err := os.Stat(dataFilePath(db.opts.Dir, id))
+		if err != nil {
+			return 0, err
+		}
+		total += info.Size()
+	}
+	return total, nil
+}
+
+===== iterator.go =====
+package zerocopybitcask
+
+import (
+	"bytes"
+	"sort"
+)
+
+type IteratorOptions struct {
+	Prefix []byte
+	Start  []byte
+	End    []byte
+}
+
+type Iterator struct {
+	db      *DB
+	entries []iteratorEntry
+	index   int
+}
+
+type iteratorEntry struct {
+	key   string
+	state RecordState
+}
+
+func (db *DB) NewIterator(opts IteratorOptions) *Iterator {
+	snapshot := db.keydir.Snapshot()
+	entries := make([]iteratorEntry, 0, len(snapshot))
+	for key, state := range snapshot {
+		keyBytes := []byte(key)
+		if state.ValueSize == 0 {
+			continue
+		}
+		if len(opts.Prefix) > 0 && !bytes.HasPrefix(keyBytes, opts.Prefix) {
+			continue
+		}
+		if len(opts.Start) > 0 && bytes.Compare(keyBytes, opts.Start) < 0 {
+			continue
+		}
+		if len(opts.End) > 0 && bytes.Compare(keyBytes, opts.End) >= 0 {
+			continue
+		}
+		entries = append(entries, iteratorEntry{key: key, state: state})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].key < entries[j].key
+	})
+	return &Iterator{
+		db:      db,
+		entries: entries,
+		index:   -1,
+	}
+}
+
+func (db *DB) Iterator() *Iterator {
+	return db.NewIterator(IteratorOptions{})
+}
+
+func (db *DB) PrefixIterator(prefix []byte) *Iterator {
+	return db.NewIterator(IteratorOptions{Prefix: prefix})
+}
+
+func (db *DB) PrefixScan(prefix []byte) *Iterator {
+	return db.NewIterator(IteratorOptions{Prefix: prefix})
+}
+
+func (db *DB) RangeScan(start, end []byte) *Iterator {
+	return db.NewIterator(IteratorOptions{Start: start, End: end})
+}
+
+func (it *Iterator) Next() bool {
+	if it == nil {
+		return false
+	}
+	it.index++
+	return it.index < len(it.entries)
+}
+
+func (it *Iterator) Key() []byte {
+	if it == nil || it.index < 0 || it.index >= len(it.entries) {
+		return nil
+	}
+	return []byte(it.entries[it.index].key)
+}
+
+func (it *Iterator) Value() ([]byte, error) {
+	if it == nil || it.index < 0 || it.index >= len(it.entries) {
+		return nil, ErrKeyNotFound
+	}
+	return it.db.getState(it.entries[it.index].state)
+}
+
+func (it *Iterator) Close() error {
+	return nil
+}
+
+===== mmap_windows.go =====
+//go:build windows
+
+package zerocopybitcask
+
+import (
+	"os"
+	"reflect"
+	"syscall"
+	"unsafe"
+)
+
+type mmapRegion struct {
+	data   []byte
+	handle syscall.Handle
+}
+
+func mmapFile(path string) (*mmapRegion, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	info, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if info.Size() == 0 {
+		return &mmapRegion{}, nil
+	}
+
+	h, err := syscall.CreateFileMapping(syscall.Handle(file.Fd()), nil, syscall.PAGE_READONLY, 0, 0, nil)
+	if err != nil {
+		return nil, err
+	}
+	addr, err := syscall.MapViewOfFile(h, syscall.FILE_MAP_READ, 0, 0, uintptr(info.Size()))
+	if err != nil {
+		_ = syscall.CloseHandle(h)
+		return nil, err
+	}
+
+	header := reflect.SliceHeader{
+		Data: addr,
+		Len:  int(info.Size()),
+		Cap:  int(info.Size()),
+	}
+	return &mmapRegion{
+		data:   *(*[]byte)(unsafe.Pointer(&header)),
+		handle: h,
+	}, nil
+}
+
+func (m *mmapRegion) Close() error {
+	if m == nil {
+		return nil
+	}
+	if len(m.data) > 0 {
+		addr := uintptr(unsafe.Pointer(&m.data[0]))
+		if err := syscall.UnmapViewOfFile(addr); err != nil {
+			return err
+		}
+		m.data = nil
+	}
+	if m.handle != 0 {
+		err := syscall.CloseHandle(m.handle)
+		m.handle = 0
+		return err
+	}
+	return nil
+}
+
+===== mmap_unix.go =====
+//go:build !windows
+
+package zerocopybitcask
+
+import (
+	"os"
+	"syscall"
+)
+
+type mmapRegion struct {
+	data []byte
+}
+
+func mmapFile(path string) (*mmapRegion, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	info, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if info.Size() == 0 {
+		return &mmapRegion{}, nil
+	}
+	data, err := syscall.Mmap(int(file.Fd()), 0, int(info.Size()), syscall.PROT_READ, syscall.MAP_SHARED)
+	if err != nil {
+		return nil, err
+	}
+	return &mmapRegion{data: data}, nil
+}
+
+func (m *mmapRegion) Close() error {
+	if m == nil || len(m.data) == 0 {
+		return nil
+	}
+	err := syscall.Munmap(m.data)
+	m.data = nil
+	return err
+}
+
+===== codec_test.go =====
+package zerocopybitcask
+
+import (
+	"encoding/binary"
+	"hash/crc32"
+	"testing"
+)
+
+func TestEncodeRecordLayout(t *testing.T) {
+	key := []byte("alpha")
+	value := []byte("bravo")
+	ts := uint64(123456789)
+
+	buf := EncodeRecord(key, value, ts)
+
+	if len(buf) != HeaderSize+len(key)+len(value) {
+		t.Fatalf("length = %d", len(buf))
+	}
+	if got := binary.BigEndian.Uint64(buf[TimestampOffset:]); got != ts {
+		t.Fatalf("timestamp = %d", got)
+	}
+	if got := binary.BigEndian.Uint32(buf[KeySizeOffset:]); got != uint32(len(key)) {
+		t.Fatalf("key size = %d", got)
+	}
+	if got := binary.BigEndian.Uint32(buf[ValueSizeOffset:]); got != uint32(len(value)) {
+		t.Fatalf("value size = %d", got)
+	}
+	if got := string(buf[HeaderSize : HeaderSize+len(key)]); got != string(key) {
+		t.Fatalf("key payload = %q", got)
+	}
+	if got := string(buf[HeaderSize+len(key):]); got != string(value) {
+		t.Fatalf("value payload = %q", got)
+	}
+	wantCRC := crc32.ChecksumIEEE(buf[TimestampOffset:])
+	if got := binary.BigEndian.Uint32(buf[CRCOffset:]); got != wantCRC {
+		t.Fatalf("crc = %d, want %d", got, wantCRC)
+	}
+}
+
+func TestVerifyRecordDetectsCorruption(t *testing.T) {
+	buf := EncodeRecord([]byte("key"), []byte("value"), 99)
+	if _, ok := VerifyRecord(buf); !ok {
+		t.Fatal("valid record failed verification")
+	}
+
+	buf[len(buf)-1] ^= 0xff
+	if _, ok := VerifyRecord(buf); ok {
+		t.Fatal("corrupt record verified")
+	}
+}
+
+func TestTombstoneRecord(t *testing.T) {
+	buf := EncodeRecord([]byte("gone"), nil, 7)
+	header, ok := VerifyRecord(buf)
+	if !ok {
+		t.Fatal("tombstone failed verification")
+	}
+	if header.ValueSize != 0 {
+		t.Fatalf("value size = %d", header.ValueSize)
+	}
+}
+
+===== db_test.go =====
+package zerocopybitcask
+
+import (
+	"bytes"
+	"testing"
+)
+
+func TestPutGetDeleteRecovery(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(Options{Dir: dir, SyncWrites: true, MaxActiveFileSize: 128})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.Put([]byte("a"), []byte("first")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Put([]byte("a"), []byte("second")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := db.Get([]byte("a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, []byte("second")) {
+		t.Fatalf("got %q", got)
+	}
+	if err := db.Delete([]byte("a")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Get([]byte("a")); err != ErrKeyNotFound {
+		t.Fatalf("delete get err = %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err = Open(Options{Dir: dir, SyncWrites: true, MaxActiveFileSize: 128})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Get([]byte("a")); err != ErrKeyNotFound {
+		t.Fatalf("recovered deleted key err = %v", err)
+	}
+}
+
+func TestIteratorPrefixAndRange(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(Options{Dir: dir, FsyncPolicy: FsyncManual})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	for _, kv := range []struct {
+		key string
+		val string
+	}{
+		{"user:001", "a"},
+		{"user:002", "b"},
+		{"user:003", "c"},
+		{"order:001", "x"},
+	} {
+		if err := db.Put([]byte(kv.key), []byte(kv.val)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Delete([]byte("user:002")); err != nil {
+		t.Fatal(err)
+	}
+
+	it := db.NewIterator(IteratorOptions{
+		Prefix: []byte("user:"),
+		Start:  []byte("user:001"),
+		End:    []byte("user:004"),
+	})
+	defer it.Close()
+
+	var keys []string
+	for it.Next() {
+		value, err := it.Value()
+		if err != nil {
+			t.Fatal(err)
+		}
+		keys = append(keys, string(it.Key())+"="+string(value))
+	}
+	want := []string{"user:001=a", "user:003=c"}
+	if !sameStrings(keys, want) {
+		t.Fatalf("keys = %#v, want %#v", keys, want)
+	}
+}
+
+func sameStrings(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func TestCompactionKeepsLiveRecords(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(Options{Dir: dir, SyncWrites: true, MaxActiveFileSize: 80})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := db.Put([]byte("a"), []byte("old")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Put([]byte("b"), []byte("live")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Put([]byte("a"), []byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := db.Get([]byte("b"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, []byte("live")) {
+		t.Fatalf("b = %q", got)
+	}
+	got, err = db.Get([]byte("a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, []byte("new")) {
+		t.Fatalf("a = %q", got)
+	}
+}
+
+func TestCompactIfNeededHonorsThreshold(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(Options{
+		Dir:                      dir,
+		FsyncPolicy:              FsyncManual,
+		MaxActiveFileSize:        64,
+		CompactionThresholdBytes: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	for i := 0; i < 10; i++ {
+		if err := db.Put([]byte{byte('k'), byte(i)}, []byte("value")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.CompactIfNeeded(); err != nil {
+		t.Fatal(err)
+	}
+	if got := db.Stats().Compactions; got == 0 {
+		t.Fatal("expected threshold compaction to run")
+	}
+}
+
+===== recovery_test.go =====
+package zerocopybitcask
+
+import (
+	"bytes"
+	"os"
+	"sync"
+	"testing"
+)
+
+func TestRecoveryTruncatesPartialWrite(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(Options{Dir: dir, FsyncPolicy: FsyncManual})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Put([]byte("stable"), []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	file, err := os.OpenFile(dataFilePath(dir, 1), os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.Write([]byte{1, 2, 3, 4, 5}); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err = Open(Options{Dir: dir, FsyncPolicy: FsyncManual})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	got, err := db.Get([]byte("stable"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, []byte("value")) {
+		t.Fatalf("got %q", got)
+	}
+	if db.Stats().CorruptRecords == 0 {
+		t.Fatal("expected corrupt record counter to increment")
+	}
+}
+
+func TestRecoveryTruncatesTornWrite(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(Options{Dir: dir, FsyncPolicy: FsyncManual})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Put([]byte("stable"), []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	file, err := os.OpenFile(dataFilePath(dir, 1), os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bad := EncodeRecord([]byte("broken"), []byte("value"), 99)
+	bad[len(bad)-1] ^= 0xff
+	if _, err := file.Write(bad); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err = Open(Options{Dir: dir, FsyncPolicy: FsyncManual})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Get([]byte("broken")); err != ErrKeyNotFound {
+		t.Fatalf("broken key err = %v", err)
+	}
+}
+
+func TestConcurrentStress(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(Options{Dir: dir, FsyncPolicy: FsyncManual, MaxActiveFileSize: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	var wg sync.WaitGroup
+	for writer := 0; writer < 4; writer++ {
+		writer := writer
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 200; i++ {
+				key := []byte{byte('a' + writer), byte(i)}
+				val := []byte{byte(i), byte(writer)}
+				if err := db.Put(key, val); err != nil {
+					t.Errorf("put: %v", err)
+					return
+				}
+				if _, err := db.Get(key); err != nil {
+					t.Errorf("get: %v", err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func FuzzRecordCodec(f *testing.F) {
+	f.Add([]byte("key"), []byte("value"), uint64(1))
+	f.Add([]byte("another-key"), []byte{}, uint64(2))
+	f.Fuzz(func(t *testing.T, key []byte, value []byte, ts uint64) {
+		if len(key) == 0 || len(key) > 1024 || len(value) > 4096 {
+			return
+		}
+		record := EncodeRecord(key, value, ts)
+		header, ok := VerifyRecord(record)
+		if !ok {
+			t.Fatal("encoded record failed verification")
+		}
+		if header.KeySize != uint32(len(key)) || header.ValueSize != uint32(len(value)) || header.Timestamp != ts {
+			t.Fatalf("header mismatch: %#v", header)
+		}
+	})
+}
+
+===== benchmark_test.go =====
+package zerocopybitcask
+
+import (
+	"encoding/binary"
+	"fmt"
+	"math/rand"
+	"os"
+	"runtime"
+	"sort"
+	"strconv"
+	"testing"
+	"time"
+)
+
+func BenchmarkRandomPointReads(b *testing.B) {
+	db, keys := buildBenchDB(b, benchRecords(), 1024)
+	defer db.Close()
+
+	rng := rand.New(rand.NewSource(1))
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		key := keys[rng.Intn(len(keys))]
+		value, err := db.Get(key)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(value) != 1024 {
+			b.Fatalf("value length = %d", len(value))
+		}
+	}
+}
+
+func BenchmarkPutThroughputManualFsync(b *testing.B) {
+	dir := b.TempDir()
+	db, err := Open(Options{
+		Dir:               dir,
+		FsyncPolicy:       FsyncManual,
+		MaxActiveFileSize: 1 << 30,
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+
+	value := make([]byte, 1024)
+	b.SetBytes(int64(len(value)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		key := []byte(fmt.Sprintf("key-%09d", i))
+		value[0] = byte(i)
+		if err := db.Put(key, value); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if err := db.Sync(); err != nil {
+		b.Fatal(err)
+	}
+}
+
+func BenchmarkPutThroughputEveryWriteFsync(b *testing.B) {
+	dir := b.TempDir()
+	db, err := Open(Options{
+		Dir:               dir,
+		FsyncPolicy:       FsyncEveryWrite,
+		MaxActiveFileSize: 1 << 30,
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+
+	value := make([]byte, 1024)
+	b.SetBytes(int64(len(value)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		key := []byte(fmt.Sprintf("key-%09d", i))
+		value[0] = byte(i)
+		if err := db.Put(key, value); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkRandomReadP99Latency(b *testing.B) {
+	db, keys := buildBenchDB(b, benchRecords(), 1024)
+	defer db.Close()
+
+	rng := rand.New(rand.NewSource(2))
+	latencies := make([]int64, 0, b.N)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		start := time.Now()
+		if _, err := db.Get(keys[rng.Intn(len(keys))]); err != nil {
+			b.Fatal(err)
+		}
+		latencies = append(latencies, time.Since(start).Nanoseconds())
+	}
+	b.StopTimer()
+
+	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+	if len(latencies) > 0 {
+		p50 := latencies[int(float64(len(latencies)-1)*0.50)]
+		p95 := latencies[int(float64(len(latencies)-1)*0.95)]
+		p99 := latencies[int(float64(len(latencies)-1)*0.99)]
+		if p50 < 1 {
+			p50 = 1
+		}
+		if p95 < 1 {
+			p95 = 1
+		}
+		if p99 < 1 {
+			p99 = 1
+		}
+		b.ReportMetric(float64(p50), "p50-ns")
+		b.ReportMetric(float64(p95), "p95-ns")
+		b.ReportMetric(float64(p99), "p99-ns")
+		b.ReportMetric(1e9/float64(p50), "p50-ops/sec")
+	}
+}
+
+func BenchmarkStartupRecovery(b *testing.B) {
+	records := benchRecords()
+	dir := b.TempDir()
+	db, err := Open(Options{Dir: dir, FsyncPolicy: FsyncManual, MaxActiveFileSize: 1 << 30})
+	if err != nil {
+		b.Fatal(err)
+	}
+	value := make([]byte, 512)
+	for i := 0; i < records; i++ {
+		key := []byte(fmt.Sprintf("recover-%09d", i))
+		if err := db.Put(key, value); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		b.Fatal(err)
+	}
+
+	var mem runtime.MemStats
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		start := time.Now()
+		db, err := Open(Options{Dir: dir, FsyncPolicy: FsyncManual, MaxActiveFileSize: 1 << 30})
+		if err != nil {
+			b.Fatal(err)
+		}
+		if err := db.Close(); err != nil {
+			b.Fatal(err)
+		}
+		b.ReportMetric(float64(time.Since(start).Nanoseconds()), "recovery-ns")
+	}
+	b.StopTimer()
+	runtime.ReadMemStats(&mem)
+	b.ReportMetric(float64(mem.Alloc), "heap-live-bytes")
+}
+
+func BenchmarkMmapVsBufferedRead(b *testing.B) {
+	dir := b.TempDir()
+	path := dir + string(os.PathSeparator) + "raw.bin"
+	data := make([]byte, 1024*1024)
+	for i := range data {
+		data[i] = byte(i)
+	}
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		b.Fatal(err)
+	}
+
+	region, err := mmapFile(path)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer region.Close()
+
+	file, err := os.Open(path)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer file.Close()
+
+	offsets := make([]int64, 4096)
+	for i := range offsets {
+		offsets[i] = int64(binary.LittleEndian.Uint32([]byte{
+			byte(i), byte(i >> 8), byte(i >> 16), byte(i >> 24),
+		}) % uint32(len(data)-4096))
+	}
+
+	b.Run("mmap", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			off := offsets[i%len(offsets)]
+			chunk := region.data[off : off+4096]
+			if len(chunk) != 4096 {
+				b.Fatal(len(chunk))
+			}
+		}
+	})
+
+	b.Run("buffered-readat", func(b *testing.B) {
+		buf := make([]byte, 4096)
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			off := offsets[i%len(offsets)]
+			if _, err := file.ReadAt(buf, off); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
+func buildBenchDB(b *testing.B, records int, valueSize int) (*DB, [][]byte) {
+	b.Helper()
+	b.StopTimer()
+	dir := b.TempDir()
+	db, err := Open(Options{
+		Dir:               dir,
+		FsyncPolicy:       FsyncManual,
+		MaxActiveFileSize: 1 << 30,
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	value := make([]byte, valueSize)
+	keys := make([][]byte, records)
+	for i := 0; i < records; i++ {
+		key := []byte(fmt.Sprintf("key-%09d", i))
+		keys[i] = key
+		value[0] = byte(i)
+		if err := db.Put(key, value); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if err := db.Sync(); err != nil {
+		b.Fatal(err)
+	}
+	b.StartTimer()
+	return db, keys
+}
+
+func benchRecords() int {
+	raw := os.Getenv("ZCBS_BENCH_RECORDS")
+	if raw == "" {
+		return 10000
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		return 10000
+	}
+	return n
+}
+
+===== docs/architecture.md =====
+# Zero-Copy Bitcask Storage Engine
+
+This project is an append-only key-value store optimized for point reads. Values are read directly from memory-mapped log files; `Get` returns a slice backed by mmap rather than allocating and copying a value buffer.
+
+## Storage Format
+
+Every record is:
+
+```text
+| CRC32 4B | Timestamp 8B | KeySize 4B | ValueSize 4B | Key | Value |
+```
+
+The CRC covers `Timestamp + KeySize + ValueSize + Key + Value`. A `ValueSize` of `0` is a tombstone.
+
+## Segment Structure
+
+```mermaid
+flowchart LR
+  S["000000001.data"] --> R1["record: key=a value=v1"]
+  S --> R2["record: key=b value=v1"]
+  S --> R3["record: key=a tombstone"]
+  T["000000002.data"] --> R4["record: key=c value=v1"]
+  T --> R5["record: key=a value=v2"]
+```
+
+Segments are immutable after rotation. The active segment is append-only. Compaction writes a fresh generation containing only live records and then opens a newer active segment.
+
+## Write Path
+
+```mermaid
+flowchart LR
+  A["Put(key, value)"] --> B["Validate sizes"]
+  B --> C["Encode record + CRC"]
+  C --> D["Append to active .data file"]
+  D --> E["fsync according to policy"]
+  E --> F["Update sharded KeyDir"]
+  F --> G["Refresh mmap registry"]
+```
+
+Fsync policies:
+
+- `FsyncEveryWrite`: acknowledge only after the active file reaches stable storage.
+- `FsyncInterval`: group fsyncs by time interval.
+- `FsyncManual`: caller is responsible for `Sync`.
+
+## Read Path
+
+```mermaid
+flowchart LR
+  A["Get(key)"] --> B["Lookup KeyDir"]
+  B --> C["Find FileID + ValueOffset"]
+  C --> D["Slice mmap bytes"]
+  D --> E["Return direct []byte view"]
+```
+
+The returned value must be treated as read-only. It points into mapped file memory.
+
+## Recovery Path
+
+```mermaid
+flowchart TD
+  A["Open database"] --> B["Sort .data files by FileID"]
+  B --> C["Scan records sequentially"]
+  C --> D{"CRC and size valid?"}
+  D -- "yes" --> E["Apply latest state to KeyDir"]
+  D -- "no / partial / torn" --> F["Truncate file at last valid offset"]
+  E --> C
+  F --> G["Map readable files and open active file"]
+```
+
+Recovery handles:
+
+- Partial writes: short headers or payloads are truncated.
+- Torn writes: invalid size fields or CRC mismatches are truncated.
+- Tombstones: delete markers rebuild as missing keys.
+
+## Mmap Lifecycle
+
+The active file is append-only. After writes, the file is remapped so new values are visible through `Get`. Older mappings are retired and closed on database shutdown, which avoids invalidating slices already returned to callers.
+
+```mermaid
+stateDiagram-v2
+  [*] --> ActiveAppend
+  ActiveAppend --> MappedActive: refresh after append
+  MappedActive --> ReadOnlyGeneration: rotate
+  ReadOnlyGeneration --> CompactionInput: threshold reached
+  CompactionInput --> RetiredMapping: compacted replacement exists
+  RetiredMapping --> Closed: DB close
+```
+
+## Compaction
+
+```mermaid
+flowchart TD
+  A["Select read-only generations"] --> B["Scan old records"]
+  B --> C{"Record timestamp matches KeyDir?"}
+  C -- "no" --> D["Drop stale record"]
+  C -- "yes, tombstone" --> E["Drop tombstone"]
+  C -- "yes, live value" --> F["Write to compacted generation"]
+  F --> G["Atomically swap generation"]
+  G --> H["Update KeyDir offsets"]
+```
+
+Compaction removes overwritten records and tombstones from read-only files. A background worker can call `RunCompaction`.
+
+## Shard Distribution
+
+```mermaid
+flowchart TD
+  K["key bytes"] --> H["FNV-1a hash"]
+  H --> M["hash % shard_count"]
+  M --> S0["Shard 0 RWMutex + map"]
+  M --> S1["Shard 1 RWMutex + map"]
+  M --> S2["Shard N RWMutex + map"]
+  S0 --> R["RecordState only: FileID, ValueOffset, ValueSize, Timestamp"]
+  S1 --> R
+  S2 --> R
+```
+
+The KeyDir never stores values. It stores only disk coordinates, keeping RAM proportional to key count rather than value size.
+
+## Observability
+
+`DB.Stats()` exposes counters for reads, writes, deletes, fsyncs, rotations, compactions, mmap refreshes, corrupt records observed during recovery, tombstones, live key count, and retired mmap regions.
+
+## Benchmarks
+
+Current benchmark coverage includes:
+
+- Random zero-copy point reads.
+- Manual-fsync write throughput.
+- Every-write-fsync throughput.
+- p99-style read latency reporting.
+- mmap slicing vs `os.File.ReadAt`.
+
+External engine comparisons such as BadgerDB, Pebble, and RocksDB should live behind build tags so the core module remains dependency-light.
+
+===== docs/benchmarks.md =====
+# Benchmark Plan
+
+Run the built-in benchmark suite:
+
+```powershell
+$env:ZCBS_BENCH_RECORDS="100000"
+go test -run '^$' -bench . -benchmem
+```
+
+Use a smaller record count for local smoke tests:
+
+```powershell
+$env:ZCBS_BENCH_RECORDS="1000"
+go test -run '^$' -bench 'BenchmarkRandomPointReads|BenchmarkMmapVsBufferedRead' -benchmem -benchtime=100ms
+```
+
+## Current Built-In Coverage
+
+- Random point-read throughput and allocations.
+- Manual-fsync write throughput.
+- Every-write-fsync write throughput.
+- p50/p95/p99 read latency metrics.
+- Startup recovery time and heap usage.
+- mmap slicing vs `os.File.ReadAt`.
+
+## External Engine Comparisons
+
+BadgerDB, Pebble, and RocksDB comparisons should be kept behind separate build tags or submodules because they bring large dependency trees and platform-specific build requirements.
+
+Recommended benchmark shape:
+
+- Use the same key distribution as `BenchmarkRandomPointReads`.
+- Preload the same number of records and same value size.
+- Run read-only random point reads with `b.ReportAllocs`.
+- Run write throughput with durability settings documented explicitly.
+- Report p50/p95/p99 latency using the same measurement helper.
+
+Suggested package layout:
+
+```text
+bench/external/badger_test.go   //go:build badgerbench
+bench/external/pebble_test.go   //go:build pebblebench
+bench/external/rocks_test.go    //go:build rocksbench
+```
+
+This keeps the core storage engine dependency-light while making apples-to-apples comparisons easy to add in a dedicated benchmark environment.
+
